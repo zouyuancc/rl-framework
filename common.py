@@ -14,7 +14,7 @@ from models import model_registry
 
 def init_components(args, unknown_args) -> Tuple[Env, Agent]:
     # Initialize environment
-    env = get_env(args.env, **unknown_args)
+    env = get_env(args.env, args.num_envs, **unknown_args)
 
     # Get model class
     if args.model is not None:
@@ -77,7 +77,7 @@ def save_yaml_config(config_path: Path, args, role_type: str, agent: Agent) -> N
 def create_experiment_dir(args, prefix: str) -> None:
     if args.exp_path is None:
         args.exp_path = prefix + datetime.datetime.fromtimestamp(time.time()).strftime('%Y-%m-%d-%H-%M-%S')
-    args.exp_path = Path(args.exp_path)
+    args.exp_path = Path("/nas_share/zouy/" + args.exp_path)
 
     if args.exp_path.exists():
         raise FileExistsError(f'Experiment directory {str(args.exp_path)!r} already exists')

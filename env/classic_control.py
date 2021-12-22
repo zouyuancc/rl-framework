@@ -27,3 +27,6 @@ class ClassicControlEnv(Env):
 
     def render(self, *args, **kwargs) -> None:
         self.env_wrapper.render()
+
+    def close(self) -> None:
+        self.env_wrapper.close()

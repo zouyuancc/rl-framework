@@ -30,3 +30,7 @@ class Env(ABC):
     @abstractmethod
     def render(self, *args, **kwargs) -> None:
         pass
+
+    @abstractmethod
+    def close(self) -> None:
+        pass

@@ -3,6 +3,7 @@ import pickle
 import subprocess
 import time
 from argparse import ArgumentParser
+from collections import deque
 from itertools import count
 from multiprocessing import Process, Array
 from pathlib import Path
@@ -13,21 +14,19 @@ import zmq
 from pyarrow import serialize
 
 from common import init_components, load_yaml_config, save_yaml_config, create_experiment_dir
-from core.mem_pool import MemPool
 from utils import logger
 from utils.cmdline import parse_cmdline_kwargs
-from evaluate import test_model
 
 parser = ArgumentParser()
 parser.add_argument('--alg', type=str, default='ppo', help='The RL algorithm')
-parser.add_argument('--env', type=str, default='CartPole-v1', help='The game environment')
-parser.add_argument('--num_steps', type=float, default=2e5, help='The number of total training steps')
-parser.add_argument('--ip', type=str, default='localhost', help='IP address of learner server')
+parser.add_argument('--env', type=str, default='PongNoFrameskip-v4', help='The game environment')
+parser.add_argument('--num_steps', type=int, default=10000000, help='The number of total training steps')
+parser.add_argument('--ip', type=str, default='127.0.0.1', help='IP address of learner server')
 parser.add_argument('--data_port', type=int, default=5000, help='Learner server port to send training data')
 parser.add_argument('--param_port', type=int, default=5001, help='Learner server port to subscribe model parameters')
 parser.add_argument('--num_replicas', type=int, default=1, help='The number of actors')
-parser.add_argument('--model', type=str, default='acmlp', help='Training model')
-parser.add_argument('--max_steps_per_update', type=int, default=4000,
+parser.add_argument('--model', type=str, default='accnn', help='Training model')
+parser.add_argument('--max_steps_per_update', type=int, default=128,
                     help='The maximum number of steps between each update')
 parser.add_argument('--exp_path', type=str, default=None,
                     help='Directory to save logging data, model parameters and config file')
@@ -35,13 +34,7 @@ parser.add_argument('--num_saved_ckpt', type=int, default=10, help='Number of re
 parser.add_argument('--max_episode_length', type=int, default=1000, help='Maximum length of trajectory')
 parser.add_argument('--config', type=str, default=None, help='The YAML configuration file')
 parser.add_argument('--use_gpu', action='store_true', help='Use GPU to sample every action')
-parser.add_argument('--use_evaluate', type=int, default=0,
-                    help='whether to evaluate the recent models,1 indicate yes,0 means no')
-parser.add_argument('--ckpt_dir', type=str, default=None,
-                    help='like "/u01/rl/", it offers the directory to find the better model')
-parser.add_argument('--ckpt_file', type=str,
-                    default=None,
-                    help='select which ckpt file to restruct the model')
+parser.add_argument('--num_envs', type=int, default=10, help='The number of environment copies')
 
 
 def run_one_agent(index, args, unknown_args, actor_status):
@@ -69,73 +62,63 @@ def run_one_agent(index, args, unknown_args, actor_status):
     else:
         logger.configure(str(args.log_path), format_strs=[])
 
-    # Create local queues for collecting data
-    transitions = []  # A list to store raw transitions within an episode
-    mem_pool = MemPool()  # A pool to store prepared training data
-
     # Initialize values
     model_id = -1
-    episode_rewards = [0.0]
-    episode_lengths = [0]
-    num_episodes = 0
-    mean_10ep_reward = 0
-    mean_10ep_length = 0
-    send_time_start = time.time()
-
+    episode_infos = deque(maxlen=100)
+    num_episode = 0
     state = env.reset()
-    for step in range(args.num_steps):
+
+    n_batch = args.num_envs * args.max_steps_per_update
+
+    nupdates = args.num_steps // (n_batch * args.num_replicas)
+
+    for update in range(1, nupdates + 1):
         # Do some updates
-        agent.update_sampling(step, args.num_steps)
+        agent.update_sampling(update, nupdates)
 
-        # Sample action
-        action, extra_data = agent.sample(state)
-        next_state, reward, done, info = env.step(action)
+        mb_states, mb_actions, mb_rewards, mb_dones, mb_extras = [], [], [], [], []
+        start_time = time.time()
+        for _ in range(args.max_steps_per_update):
 
-        # Record current transition
-        transitions.append((state, action, reward, next_state, done, extra_data))
-        episode_rewards[-1] += reward
-        episode_lengths[-1] += 1
+            mb_states.append(state)
 
-        state = next_state
+            # Sample action
+            action, extra_data = agent.sample(state)
+            state, reward, done, info = env.step(action)
 
-        is_terminal = done or episode_lengths[-1] >= args.max_episode_length > 0
-        if is_terminal or len(mem_pool) + len(transitions) >= args.max_steps_per_update:
-            # Current episode is terminated or a trajectory of enough training data is collected
-            data = agent.prepare_training_data(transitions)
-            transitions.clear()
-            mem_pool.push(data)
+            mb_actions.append(action)
+            mb_rewards.append(reward)
+            mb_dones.append(done)
+            mb_extras.append(extra_data)
 
-            if is_terminal:
-                # Log information at the end of episode
-                num_episodes = len(episode_rewards)
-                mean_10ep_reward = round(np.mean(episode_rewards[-10:]), 2)
-                mean_10ep_length = round(np.mean(episode_lengths[-10:]), 2)
-                episode_rewards.append(0.0)
-                episode_lengths.append(0)
+            for info_i in info:
+                maybeepinfo = info_i.get('episode')
+                if maybeepinfo:
+                    episode_infos.append(maybeepinfo)
+                    num_episode += 1
 
-                # Reset environment
-                state = env.reset()
+        mb_states = np.asarray(mb_states, dtype=state.dtype)
+        mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
+        mb_actions = np.asarray(mb_actions)
+        mb_dones = np.asarray(mb_dones, dtype=np.bool)
 
-        if len(mem_pool) >= args.max_steps_per_update:
-            # Send training data after enough training data (>= 'arg.max_steps_per_update') is collected
-            post_processed_data = agent.post_process_training_data(mem_pool.sample())
-            socket.send(serialize(post_processed_data).to_buffer())
-            socket.recv()
-            mem_pool.clear()
+        data = agent.prepare_training_data([mb_states, mb_actions, mb_rewards, mb_dones, state, mb_extras])
+        post_processed_data = agent.post_process_training_data(data)
+        socket.send(serialize(post_processed_data).to_buffer())
+        socket.recv()
 
-            send_data_interval = time.time() - send_time_start
-            send_time_start = time.time()
-
-            if num_episodes > 0:
-                # Log information
-                logger.record_tabular("iteration", (step + 1) // args.max_steps_per_update)
-                logger.record_tabular("steps", step)
-                logger.record_tabular("episodes", len(episode_rewards))
-                logger.record_tabular("mean 10 episode reward", mean_10ep_reward)
-                logger.record_tabular("mean 10 episode length", mean_10ep_length)
-                logger.record_tabular("send data fps", args.max_steps_per_update // send_data_interval)
-                logger.record_tabular("send data interval", send_data_interval)
-                logger.dump_tabular()
+        send_data_interval = time.time() - start_time
+        # Log information
+        logger.record_tabular("steps", update * n_batch)
+        logger.record_tabular("episodes", num_episode)
+        logger.record_tabular("mean 100 episode reward",
+                              round(np.mean([epinfo['reward'] for epinfo in episode_infos]), 2))
+        logger.record_tabular("mean 100 episode length",
+                              round(np.mean([epinfo['length'] for epinfo in episode_infos]), 2))
+        logger.record_tabular("send data interval", send_data_interval)
+        logger.record_tabular("send data fps", n_batch // send_data_interval)
+        logger.record_tabular("total steps", nupdates * n_batch)
+        logger.dump_tabular()
 
         # Update weights
         new_weights, model_id = find_new_weights(model_id, args.ckpt_path)
@@ -255,11 +238,6 @@ def main():
         agent.join()
 
     subscriber.join()
-
-    if args.use_evaluate == 1:
-        print("evaluate_result:")
-        args.ckpt_dir = str(args.ckpt_path) + "/"
-        test_model(args, unknown_args)
 
 
 if __name__ == '__main__':

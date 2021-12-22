@@ -1,12 +1,10 @@
 from core.env import Env
 
-from .atari_wrappers import make_env
-
 
 class AtariEnv(Env):
-    def __init__(self, gym_env_id, history_length=4, *args, **kwargs):
+    def __init__(self, gym_env, *args, **kwargs):
         super(AtariEnv, self).__init__(*args, **kwargs)
-        self.env_wrapper = make_env(gym_env_id, history_length)
+        self.env_wrapper = gym_env
 
     def reset(self):
         return self.env_wrapper.reset()
@@ -25,3 +23,6 @@ class AtariEnv(Env):
 
     def render(self) -> None:
         self.env_wrapper.render()
+
+    def close(self) -> None:
+        self.env_wrapper.close()

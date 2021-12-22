@@ -4,8 +4,9 @@ from collections import defaultdict
 import gym
 
 from core.env import Env
-from .atari import AtariEnv
+from .atari import AtariEnv, make_atari
 from .classic_control import ClassicControlEnv
+from .vec_env import SubprocVecEnv, VecFrameStack, DummyVecEnv
 
 mapping = {
     'atari': AtariEnv,
@@ -35,7 +36,7 @@ def _get_gym_env_type(env_id):
     return env_type
 
 
-def get_env(env_id: str, **kwargs) -> Env:
+def get_env(env_id: str, num_envs: int, **kwargs) -> Env:
     env_type = _get_gym_env_type(env_id)
 
     if env_type is None:
@@ -45,6 +46,18 @@ def get_env(env_id: str, **kwargs) -> Env:
             ValueError(f'Unknown environment: {env_type}')
 
         return mapping[env_type](**kwargs)
+
+    elif env_type == 'atari':
+        def make_thunk():
+            return lambda: make_atari(env_id)
+
+        if num_envs > 1:
+            env = SubprocVecEnv([make_thunk() for _ in range(num_envs)])
+        else:
+            env = DummyVecEnv([make_thunk() for _ in range(num_envs)])
+        env = VecFrameStack(env, 4)
+        return AtariEnv(env)
+
     else:
         if env_type not in mapping:
             ValueError(f'Unknown environment: {env_type}')

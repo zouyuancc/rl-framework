@@ -2,7 +2,6 @@ import multiprocessing
 import pickle
 import subprocess
 from argparse import ArgumentParser
-from itertools import count
 from multiprocessing import Process
 
 import horovod.tensorflow.keras as hvd
@@ -13,6 +12,7 @@ from tensorflow.keras.backend import set_session
 
 from common import init_components, load_yaml_config, save_yaml_config, create_experiment_dir
 from core.mem_pool import MemPoolManager, MultiprocessingMemPool
+from utils import logger
 from utils.cmdline import parse_cmdline_kwargs
 
 # Horovod: initialize Horovod.
@@ -23,27 +23,28 @@ config = tf.ConfigProto()
 config.gpu_options.allow_growth = True
 config.gpu_options.visible_device_list = str(hvd.local_rank())
 set_session(tf.Session(config=config))
-callbacks = [hvd.callbacks.BroadcastGlobalVariablesCallback(0)]
 
 parser = ArgumentParser()
 parser.add_argument('--alg', type=str, default='ppo', help='The RL algorithm')
-parser.add_argument('--env', type=str, default='CartPole-v1', help='The game environment')
-parser.add_argument('--num_steps', type=float, default=2e5, help='The number of total training steps')
+parser.add_argument('--env', type=str, default='PongNoFrameskip-v4', help='The game environment')
+parser.add_argument('--num_steps', type=int, default=10000000, help='The number of total training steps')
 parser.add_argument('--data_port', type=int, default=5000, help='Learner server port to receive training data')
 parser.add_argument('--param_port', type=int, default=5001, help='Learner server to publish model parameters')
-parser.add_argument('--model', type=str, default='acmlp', help='Training model')
-parser.add_argument('--pool_size', type=int, default=4000, help='The max length of data pool')
+parser.add_argument('--model', type=str, default='accnn', help='Training model')
+parser.add_argument('--pool_size', type=int, default=1280, help='The max length of data pool')
 parser.add_argument('--training_freq', type=int, default=1,
                     help='How many receptions of new data are between each training, '
                          'which can be fractional to represent more than one training per reception')
-parser.add_argument('--keep_training', action='store_true', help="No matter whether new data is received recently, "
-                                                                 "keep training as long as the data is enough and"
-                                                                 "ignore '--training_freq'")
-parser.add_argument('--batch_size', type=int, default=4000, help='The batch size for training')
+parser.add_argument('--keep_training', type=bool, default=False,
+                    help="No matter whether new data is received recently, keep training as long as the data is enough "
+                         "and ignore `--training_freq`")
+parser.add_argument('--batch_size', type=int, default=1280, help='The batch size for training')
 parser.add_argument('--exp_path', type=str, default=None, help='Directory to save logging data and config file')
 parser.add_argument('--config', type=str, default=None, help='The YAML configuration file')
 parser.add_argument('--record_throughput_interval', type=int, default=10,
                     help='The time interval between each throughput record')
+parser.add_argument('--num_envs', type=int, default=1, help='The number of environment copies')
+parser.add_argument('--ckpt_save_freq', type=int, default=10, help='The number of updates between each weights saving')
 
 
 def main():
@@ -60,11 +61,17 @@ def main():
     weights_socket = context.socket(zmq.PUB)
     weights_socket.bind(f'tcp://*:{args.param_port}')
 
-    env, agent = init_components(args, unknown_args)
+    _, agent = init_components(args, unknown_args)
 
-    # Save configuration file
+    # Configure experiment directory
     create_experiment_dir(args, 'LEARNER-')
     save_yaml_config(args.exp_path / 'config.yaml', args, 'learner', agent)
+    args.log_path = args.exp_path / 'log'
+    args.ckpt_path = args.exp_path / 'ckpt'
+    args.ckpt_path.mkdir()
+    args.log_path.mkdir()
+
+    logger.configure(str(args.log_path))
 
     # Record commit hash
     with open(args.exp_path / 'hash', 'w') as f:
@@ -84,9 +91,13 @@ def main():
     # Print throughput statistics
     Process(target=MultiprocessingMemPool.record_throughput, args=(mem_pool, args.record_throughput_interval)).start()
 
-    for step in count(1):
+    update = 0
+    nupdates = args.num_steps // args.batch_size
+
+    while True:
         # Do some updates
-        agent.update_training(step, args.num_steps)
+        agent.update_training(update, nupdates)
+        print(agent.lr)
 
         if len(mem_pool) >= args.batch_size:
             if args.keep_training:
@@ -98,11 +109,22 @@ def main():
                     data = mem_pool.sample(size=args.batch_size)
                     num_receptions.value -= args.training_freq
                 # Training
-                agent.learn(data)
+                stat = agent.learn(data)
+                if stat is not None:
+                    for k, v in stat.items():
+                        logger.record_tabular(k, v)
+                logger.dump_tabular()
 
             # Sync weights to actor
+            weights = agent.get_weights()
             if hvd.rank() == 0:
-                weights_socket.send(pickle.dumps(agent.get_weights()))
+                weights_socket.send(pickle.dumps(weights))
+            update += 1
+
+            if update % args.ckpt_save_freq == 0:
+                with open(args.ckpt_path / f'{args.alg}.{args.env}.ckpt',
+                          'wb') as f:
+                    pickle.dump(weights, f)
 
 
 def recv_data(data_port, mem_pool, receiving_condition, num_receptions, keep_training):
